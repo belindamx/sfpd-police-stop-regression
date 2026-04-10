@@ -1,0 +1,622 @@
+---
+title: "Descriptive Regression of San Francisco Police Stop Durations"
+output: pdf_document
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+set.seed(123) 
+
+library(xtable)
+library(broom)
+library(dplyr)
+library(lubridate)
+library(GGally)
+library(stringr)
+library(stargazer)
+library(sandwich)
+library(patchwork)
+library(ggplot2)
+library(knitr)
+library(tibble)
+library(magrittr)
+library(kableExtra)
+
+options(stargazer.comment = FALSE)
+
+```
+
+### Introduction
+
+Over 50% of Americans believe that major changes need to be made to their local police department. Public discourse indicates that racially motivated incidents may be the cause for these numbers. Because of this, we are interested in describing how stop duration varies across perceived race, age, and gender in San Francisco. We use police stop data reported by the San Francisco Police Department (SFPD). In this dataset, we can see how officers perceived these traits in individuals, as well as other details about the stops.
+
+With this information, we can pose our primary question: How does stop duration vary across an individual’s perceived race, age, and gender in San Francisco police stops?
+
+To answer this, we have built two models that have helped us to determine:
+
+1. Does stop duration vary across perceived racial groups?
+
+2. How does this relationship change when adding perceived age and perceived gender?
+
+3. How does adding other contextual stop information (e.g. suspicion of a crime, type of stop made, response to a call, SF district, traffic violation, and time of day) change the estimated relationships between perceived demographic group and stop duration?
+
+We use stop duration as a descriptive measure of how interactions differ across perceived demographic groups. Longer stops may reflect additional questioning, background checks, or follow up procedures such as arrest or ticketing. While our analysis does not imply a causal relationship, understanding the variation in stop duration based on perceived demographic groups is relevant to SF residents and law enforcement interested in understanding potential inequities in policing practices.
+
+```{r, echo = FALSE}
+stops <- read.csv('Police_Department_Stop_data_20251125.csv')
+```
+
+### Data Source
+
+As stated above, we use publicly available police stop data from the San Francisco Police Department (SFPD), accessed through the SF Open Data Portal. This information is collected under the California Racial and Identity Profiling Act (RIPA; AB 953), which mandates that officers document demographic and contextual data for every stop. At each shift, officers record stop details into the SFPD Stop Data Collection System, which is submitted to the California Department of Justice (CA DOJ). 
+
+The unit of observation is an individual involved in a police stop. A single stop may involve more than one person, so each row includes both a stop identifier and a unique person identifier. Please note that demographic characteristics (perceived race, gender, and age) are recorded based on officer perception rather than self-identification, an important consideration when interpreting potential disparities.The dataset spans July 2018 through September 2025 and includes roughly 315,000 observations before filtering. Key variables used in this analysis include perceived race/ethnicity, perceived gender, perceived age, duration of the stop in minutes, and other contextual features. The dataset is large, cross-sectional, and appropriate for descriptive modeling aimed at characterizing differences in stop duration across demographic groups
+
+### Loading and Cleaning the Dataset
+
+We found the raw data to be messy; in an attempt to improve the data quality, we implemented a series of cleaning and recoding measures. This ensured that any obviously erroneous values are excluded, and the scope of the study is narrowed to stops of adults in San Francisco. These operations reduced our sample size from 314,832 in the raw dataset to 285,588 samples in the cleaned table. Full details on the cleaning measures can be found in the appendix. 
+
+
+```{r, echo = FALSE}
+stops <- stops %>%
+ mutate(
+  perceived_race_clean = case_when(
+     grepl('black', stops$perceived_race_ethnicity, ignore.case = TRUE) ~ "Black / African American",
+     grepl('hispanic', stops$perceived_race_ethnicity, ignore.case = TRUE) |
+     grepl('latin', stops$perceived_race_ethnicity, ignore.case = TRUE) ~ "Hispanic / Latino(a/x)",
+     grepl('other', stops$perceived_race_ethnicity, ignore.case = TRUE) |
+     grepl('multi-racial', stops$perceived_race_ethnicity, ignore.case = TRUE) |
+     grepl('islander', stops$perceived_race_ethnicity, ignore.case = TRUE) |
+     grepl('native', stops$perceived_race_ethnicity, ignore.case = TRUE) ~ "Other",
+   TRUE ~ perceived_race_ethnicity
+  )
+ )
+
+stops <- stops %>%
+      mutate(
+        gender_clean = case_when(
+          grepl('transgender', stops$perceived_gender, ignore.case = TRUE) ~ 'Not Cisgender',
+          grepl('nonbinary', stops$perceived_gender, ignore.case = TRUE) ~ 'Not Cisgender',
+          grepl('nonconforming', stops$perceived_gender, ignore.case = TRUE) ~ 'Not Cisgender', 
+          grepl('Cisgender man / boy', stops$perceived_gender, ignore.case = TRUE) ~ 'Male', 
+          grepl('Cisgender woman / girl', stops$perceived_gender, ignore.case = TRUE) ~ 'Female', 
+          TRUE ~ stops$perceived_gender
+        )
+      )
+```
+
+
+```{r, echo = FALSE}
+stops <- stops %>%
+  mutate(
+    perceived_age = gsub(",", "", perceived_age),
+    duration_of_stop = gsub(",", "", duration_of_stop),
+    perceived_age = as.numeric(perceived_age),
+    duration_of_stop = as.numeric(duration_of_stop)
+  )
+
+clean <- stops %>%
+  filter(perceived_age >= 18) %>%
+  select(where(~ mean(is.na(.)) <= 0.85)) %>%
+  mutate(duration_of_stop = as.numeric(duration_of_stop)) %>%  # convert
+  filter(!is.na(duration_of_stop)) %>% 
+  filter(perceived_age <= 100) %>% 
+  filter(duration_of_stop > 0) %>% 
+  filter(duration_of_stop < 480) %>% 
+  filter(district != "") %>% 
+  filter(city == "SAN FRANCISCO")
+
+clean$duration_of_stop_log <- log(clean$duration_of_stop)
+
+clean <- clean %>%
+  mutate(
+    age_group = case_when(
+      perceived_age < 29 ~ "18-28",
+      perceived_age >= 29 & perceived_age < 45 ~ "29-44",
+      perceived_age >= 45 & perceived_age < 61 ~ "45-60",
+      perceived_age >= 61 ~ "61+",
+      TRUE ~ NA_character_
+    ) 
+  )  %>%
+  mutate(perceived_race_clean = recode(perceived_race_clean,
+                                 "Middle Eastern or South Asian" = "MESA"))
+clean$age_group <- factor(clean$age_group)
+clean$age_group <- relevel(clean$age_group, ref = "18-28")
+clean$perceived_race_clean <- relevel(factor(clean$perceived_race_clean), ref = 'White')
+```
+
+```{r, echo = FALSE}
+clean$season <- case_when(
+              month(ymd_hms(clean$stop_datetime)) %in% c(12, 1, 2)  ~ "Winter",
+              month(ymd_hms(clean$stop_datetime)) %in% c(3, 4, 5)   ~ "Spring",
+              month(ymd_hms(clean$stop_datetime)) %in% c(6, 7, 8)   ~ "Summer",
+              month(ymd_hms(clean$stop_datetime)) %in% c(9, 10, 11) ~ "Fall"
+              )
+
+clean <- clean %>%
+  mutate(
+    stop_type = case_when(
+      stop_type == "Bicycle Stop" ~ "Pedestrian Stop",
+      stop_type == "Pedestrian Stop (includes all others, e.g., stops in a residence, passengers on bus or train, skateboarders, etc.)" ~ "Pedestrian Stop",
+      TRUE ~ stop_type
+      ),
+      
+    is_stop_response_to_call_num = ifelse(is_stop_response_to_call == "Y", 1, 0),
+    
+    is_traffic_violation = ifelse(reason_for_stop == "Traffic violation", 1, 0),
+    
+    suspicion_of_crime = ifelse(str_detect(reason_for_stop, "criminal activity"), 1, 0),
+  
+    arrested = ifelse(str_detect(results_of_stop, "arrest"), 1, 0),
+    
+    stop_datetime_parsed = ymd_hms(stop_datetime),
+    
+    time_of_day_6hr = case_when(
+      hour(stop_datetime_parsed) >= 6  & hour(stop_datetime_parsed) < 12 ~ "Morning",
+      hour(stop_datetime_parsed) >= 12 & hour(stop_datetime_parsed) < 18 ~ "Afternoon",
+      hour(stop_datetime_parsed) >= 18 & hour(stop_datetime_parsed) < 24 ~ "Evening",
+      TRUE ~ "Night"
+    ),
+    
+    day_or_night = ifelse(hour(stop_datetime_parsed) >= 6 & 
+                               hour(stop_datetime_parsed) < 18, "Day", "Night"),
+    
+    district = toupper(district)
+  )
+
+```
+
+
+```{r, echo = FALSE}
+exploration <- clean %>% slice_sample(prop = 0.3)
+confirmation <- clean %>% anti_join(exploration, by = colnames(clean))
+```
+
+### Operationalization 
+
+To operationalize the concept of how perceived race plays a factor in potential police bias and treatment of individuals, we use duration of stop as our outcome variable. This serves as a measurable way to describe how the nature of stops may vary across demographic groups. As an alternative, we considered using arrest outcome. Ultimately, we decided that stop duration was a better, more comprehensive fit because we want to capture instances in which an arrest does not take place but there may still be variation across demographic groups. A follow up study could focus on the relationship between race and arrest outcome.
+
+The distribution of sample values for duration of stop has a heavy right skew. To address this, we transformed the variable by taking the natural log. As shown in the figure below, the transformed field follows a roughly normal distribution, which is useful for our linear model. We used this transformed field in our data exploration and model creation. We will un-transform stop duration values later in this paper when interpreting our model parameters for ease of understanding.
+
+```{r, echo = FALSE}
+
+p1 <- ggplot(exploration, aes(x = duration_of_stop)) +
+  geom_histogram(bins = 40, fill = "skyblue", color = "white") +
+  labs(
+    title = "Duration of Stop",
+    x = "Duration of Stop",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5),
+    plot.margin = margin(t = 8, r = 6, b = 6, l = 6)
+  )
+# force title to wrap so it won't overflow the margin in PDF
+p2 <- ggplot(exploration, aes(x = duration_of_stop_log)) +
+  geom_histogram(bins = 40, fill = "skyblue", color = "white") +
+  labs(
+    title = "Duration of Stop\n(Natural Log Scale)",
+    x = "Log Duration of Stop",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5),
+    plot.margin = margin(t = 8, r = 6, b = 6, l = 6)
+  )
+# side-by-side; patchwork renders this as ONE figure which the chunk sizing controls
+p1 + p2 + plot_layout(ncol = 2)
+
+```
+
+
+### Model Assumptions
+
+Before proceeding with producing linear models to measure the relationship between perceived race and stop duration, we first assessed the necessary assumptions.
+
+With a large sample (n = ~285k), we can assume that the sampling distribution is approximately normal by the Central Limit Theorem. We focus on validating that the data is independent and identically distributed (IID) and that a unique best linear predictor (BLP) exists.
+
+While each row represents a distinct person-stop encounter, the IID assumption is not fully satisfied because officers and districts may systematically differ, creating clustering within the data. However, for the purposes of a large-sample descriptive model, we treat the observations as approximately independent given the large dataset. In terms of being identically distributed, all observations are collected through the same RIPA-mandated reporting system, so the measurement process is consistent across rows, making this assumption reasonably plausible.
+
+To verify that there is a unique BLP, we assessed that no predictor was an exact linear combination of another i.e. each predictor provides unique information and cannot be recreated by another. Given the bounded nature of the stop duration (capped at 480 minutes) and log transformation applied, the outcome variable has finite variance, supporting the existence of a unique best linear predictor. To validate this, we ran the model and none of the regression features were dropped.
+
+### Model Specification
+
+To measure the relationship between perceived race and stop duration, we produced two linear models. The base model included only the cleaned perceived race field. The second model was produced by brainstorming and iterating on additional model inputs. Its features were chosen because they had a highly significant relationship with stop duration, and improved the model's ability to explain variation in stop duration.
+
+| Field | Logic (if not raw column values) | Justification |
+|-------|----------------------------------|----------------|
+| Perceived Race | Contains ‘black’ → **Black / African American** <br>. Contains ‘hispanic’ → **Hispanic / Latino(a/x)** <br>. Contains ‘other’, ‘multi-racial’, ‘islander’, or ‘native’ → **Other** | Combining values with low sample count under “Other” <br><br> Aggregating samples with spelling differences but clearly equal meaning |
+|  |  |  |
+| Perceived Gender | Contains ‘transgender’, ‘nonbinary’, or ‘nonconforming’ → **Not Cisgender** <br>. Contains ‘Cisgender man / boy’ → **Male** <br>. Contains ‘Cisgender woman / girl’ → **Female** | Aggregating samples with spelling differences but clearly equal meaning |
+|  |  |  |
+| Age Group | Buckets samples by perceived age 18–28, 29–44, 45–60, and 61+ | We hypothesize that oldest and youngest individuals might be stopped for less time than middle-aged individuals. Using buckets avoids issues with a metric scale |
+|  |  |  |
+| Traffic Violation | 0 or 1 if reason for stop equals ‘Traffic violation’ | Recode Y/N to 0/1 |
+|  |  |  |
+| Suspicion of Crime | 0 or 1 if reason for stop contains ‘criminal activity’ | Recode Y/N to 0/1 |
+|  |  |  |
+| Response to Call | 0 or 1 if response_to_call equals ‘Y’ | Recode Y/N to 0/1 |
+|  |  |  |
+| Time of Day | 6am–12pm → **Morning** <br> 12pm–6pm → **Afternoon** <br> 6pm–12am → **Evening** <br> 12am–6am → **Night** | A metric scale for hour of day is not appropriate when 11pm is not very different from 1am. Creating buckets avoids pitfalls from metric scale values |
+|  |  |  |
+| Stop Type | Pedestrian stop and bicycle stop combined into **Pedestrian Stop** | Low sample count for bicycle stops, which are similar in nature to pedestrian stops |
+|  |  |  |
+| District | N/A | N/A |
+
+
+```{r, echo = FALSE}
+base_model <- lm(duration_of_stop_log ~ perceived_race_clean, data = confirmation)
+```
+
+```{r, echo = FALSE}
+model <- lm(duration_of_stop_log ~ perceived_race_clean + 
+                                        gender_clean + 
+                                        age_group +
+                                        suspicion_of_crime +
+                                        stop_type +
+                                        is_stop_response_to_call_num +
+                                        district +
+                                        is_traffic_violation +
+                                        time_of_day_6hr, data = confirmation)
+```
+
+
+
+### Model Result and Interpretation
+
+In our base model, we have set the intercept to White, as that is the majority race in San Francisco. Our resulting p values can be seen in the summary below:
+
+```{r, echo = FALSE, results='asis'}
+#summary(base_model)
+
+stargazer(
+  base_model,
+  header = FALSE,
+  omit.table.layout = "n",
+  se = sqrt(diag(vcovHC(base_model))),
+  type = if (knitr::is_latex_output()) "latex" else "html",
+  float = FALSE,
+  longtable = TRUE,
+  
+  covariate.labels = c(
+    "Asian", "Black", "Hispanic/Latino", "MESA", "Other"
+  ),
+ 
+  digits = 2,
+  omit.stat = c('ser', 'f'),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  title = "Regression of Stop Duration on Perceived Race"
+)
+```
+
+The p-value for the model is well below .05 as are the p values for each race. This means that the observed effect is not likely to be caused by noise in the data. In this case, we reject the null hypothesis that stop duration for individuals who are not perceived white is the same as it is for individuals who are perceived white. Now, we can begin to analyze the difference in average stop times for each of these racial groups:
+
+```{r, echo = FALSE}
+time_diff <- rownames_to_column(
+  data.frame(ratio = exp(base_model$coefficients)), 
+  var = 'Perceived Race')
+
+time_diff[1,1] <- 'White (Intercept)'
+time_diff[2,1] <- 'Asian'
+time_diff[3,1] <- 'Black'
+time_diff[4,1] <- 'Hispanic/Latino'
+time_diff[5,1] <- 'MESA'
+time_diff[6,1] <- 'Native American'
+
+time_diff$percent_diff <- (time_diff$ratio - 1) * 100
+time_diff$percent_diff[time_diff$`Perceived Race` == "White (Intercept)"] <- 0
+time_diff$ratio[time_diff$`Perceived Race` == "White (Intercept)"] <- 1
+```
+
+
+```{r, echo = FALSE, fig.width=7, fig.height=3.9, out.width='\\linewidth'}
+time_diff$`Perceived Race` <-
+  relevel(factor(time_diff$`Perceived Race`), ref = 'White (Intercept)')
+
+time_diff <- time_diff[order(-time_diff$`ratio`), ]
+time_diff$`Perceived Race` <- factor(
+  time_diff$`Perceived Race`,
+  levels = time_diff$`Perceived Race`
+)
+
+ggplot(
+  time_diff,
+  aes(
+    x = `Perceived Race`,
+    y = ratio,
+    fill = `Perceived Race`
+    )
+  ) +
+  geom_bar(
+    stat = 'identity',
+    fill = 'skyblue'
+    ) +
+  geom_hline(
+    yintercept = time_diff[4,2],
+    linetype = "dashed",
+    color = "red"
+    ) +
+  geom_text(aes(
+    label = paste0(round(percent_diff), "%"),
+    vjust = -0.25)) +
+  labs(
+    title = "How Does Stop Duration Vary by Perceived Race?",
+    x = "Perceived Race",
+    y = "% Difference From White"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+Here we can see how each perceived race's stop time differs from those who are perceived white. Asian and Middle Eastern/South Asian (MESA) perceived individuals see a decrease in their  stop time of 14% and 21%, respectively. With each other perceived race assessed to experience a stop time increases of at least 9%, with Black and Hispanic individuals showing the largest increase. Based on this model, if a hypothetical individual was perceived to be White and stopped for 10 minutes, the stop time for that same individual would be 11 minutes and 29 seconds if they were perceived to be Black As it relates to our primary question, this model would indicate that perceived race does relate to the duration of a traffic stop.
+
+However, the summary only shows an R^2^ of just .0168. This means just 1.68% of the variability in stop duration is explained by perceived race. Perhaps there are other factors that could be contributing to these differences. In the next model, we add a few more features to determine if they can improve the amount of variability we are able to explain.
+
+Using a stargazer table, we can compare the results of our two models. Note that this table includes only perceived race, gender, and age variables, while the second model additionally contains the contextual variables mentioned above.
+
+```{r, echo = FALSE, results='asis'}
+stargazer(
+  base_model,
+  model,
+  header = FALSE,
+  comment = FALSE,
+  omit.table.layout = "n",
+  se = list(
+    sqrt(diag(vcovHC(base_model))),
+    sqrt(diag(vcovHC(model)))
+  ),
+  type = if (knitr::is_latex_output()) "latex" else "html",
+  float = FALSE,
+  longtable = TRUE,
+  
+  # Only keep Race, Gender, and Age variables
+  keep = c("perceived_race_clean", "gender_clean", "age_group"),
+  
+  covariate.labels = c(
+    "Asian", "Black", "Hispanic/Latino", "MESA", "Other",
+    "Male", "Not Cisgender", 
+    "Age: 29-44", "Age: 45-60", "Age: 61+"
+  ),
+  
+  digits = 2,
+  omit.stat = c('ser', 'f'),
+  star.cutoffs = c(0.05, 0.01, 0.001),
+  title = "Regression of Stop Duration on Perceived Race, Age, and Gender"
+)
+```
+
+
+Our intercept here includes: Race = White, Stop Type = Other, Age Group = 18 – 28, District = Airport, Gender = Female, No suspicion of crime, Not a response to a call, Not a traffic violation, and Time of Day = Afternoon.
+
+The first point of note is that the R^2^ for this new model is 0.25, which means it is able to explain ~23% more of the variability than our previous model. Given that the nature of this data is based in human behavior, we feel that this is an adequately robust level of explainability.
+
+Looking at the p-values between our two models, we see that the changes in stop duration driven by those perceived to be Middle Eastern or South Asian (MESA) lose their statistical significance. Given that this racial group is made up of a small sample size, it is likely that adding features sliced up their pools of information. For this feature, the difference in stop duration we saw previously seems to be explained by some of the other variables we included. Other than this, our features appear to be statistically significant predictors of police stop duration.
+
+We can now look at the “un-transformed” values again to understand the practical impacts of these features:
+
+```{r, echo = FALSE, fig.width=7, fig.height=3.9, out.width='\\linewidth'}
+time_diff_2 <- rownames_to_column(
+  data.frame(ratio = exp(model$coefficients)),
+  var = 'Feature')
+time_diff_2[1,1] <- 'White, Female, Age: 18-28 (Intercept)'
+time_diff_2[2,1] <- 'Asian'
+time_diff_2[3,1] <- 'Black'
+time_diff_2[4,1] <- 'Hispanic/Latino'
+time_diff_2[5,1] <- 'MESA'
+time_diff_2[6,1] <- 'Other'
+time_diff_2[7,1] <- 'Male'
+time_diff_2[8,1] <- 'Not Cisgender'
+time_diff_2[9,1] <- 'Age: 29-44'
+time_diff_2[10,1] <- 'Age: 45-60'
+time_diff_2[11,1] <- 'Age: 61+'
+time_diff_2[12,1] <- 'Suspicion of crime'
+time_diff_2[13,1] <- 'Pedestrian stop'
+time_diff_2[14,1] <- 'Vehicular stop'
+time_diff_2[15,1] <- 'Response to call'
+time_diff_2[16,1] <- 'District: Bayview'
+time_diff_2[17,1] <- 'District: Central'
+time_diff_2[18,1] <- 'District: Ingleside'
+time_diff_2[19,1] <- 'District: Mission'
+time_diff_2[20,1] <- 'District: Northern'
+time_diff_2[21,1] <- 'District: Unknown/Out of SF'
+time_diff_2[22,1] <- 'District: Park'
+time_diff_2[23,1] <- 'District: Richmond'
+time_diff_2[24,1] <- 'District: Southern'
+time_diff_2[25,1] <- 'District: Taraval'
+time_diff_2[26,1] <- 'District: Tenderloin'
+time_diff_2[27,1] <- 'Traffic Violation'
+time_diff_2[28,1] <- 'Time of day: Evening'
+time_diff_2[29,1] <- 'Time of day: Morning'
+time_diff_2[30,1] <- 'Time of day: Night'
+time_diff_2$percent_diff <- (time_diff_2$ratio - 1) * 100
+time_diff_2$percent_diff[time_diff_2$Feature == 'White, Female, Age: 18-28 (Intercept)'] <- 0
+time_diff_2$ratio[time_diff_2$Feature == 'White, Female, Age: 18-28 (Intercept)'] <- 1
+race_diff <- time_diff_2[c(1,2,3,4,5,6 ),]
+race_diff[1,1] <- 'White (Intercept)'
+race_diff$Feature <-
+  relevel(factor(race_diff$Feature), ref = 'White (Intercept)')
+race_diff <- race_diff[order(-race_diff$`ratio`), ]
+race_diff$Feature <- factor(
+  race_diff$Feature,
+  levels = race_diff$Feature
+)
+ggplot(
+  race_diff,
+  aes(
+    x = Feature,
+    y = ratio,
+    fill = Feature
+    )
+  ) +
+  geom_bar(
+    stat = 'identity',
+    fill = 'skyblue'
+    ) +
+  geom_hline(
+    yintercept = race_diff[5,2],
+    linetype = "dashed",
+    color = "red"
+    ) +
+  geom_text(aes(
+    label = paste0(round(percent_diff), "%"),
+    vjust = -0.2)) +
+  labs(
+    title = "How Does Stop Duration Vary by Perceived Race When Contextualizing?",
+    x = "Perceived Race",
+    y = "% Difference From White"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r, echo = FALSE, fig.width=7, fig.height=3.9, out.width='\\linewidth'}
+age_diff <- time_diff_2[c(1, 9, 10, 11),]
+age_diff[1,1] <- 'Age: 18-28'
+age_diff$Feature <-
+  relevel(factor(age_diff$Feature), ref = 'Age: 18-28')
+age_diff <- age_diff[order(-age_diff$`ratio`), ]
+age_diff$Feature <- factor(
+  age_diff$Feature,
+  levels = age_diff$Feature
+)
+ggplot(
+  age_diff,
+  aes(
+    x = Feature,
+    y = ratio,
+    fill = Feature
+    )
+  ) +
+  geom_bar(
+    stat = 'identity',
+    fill = 'skyblue'
+    ) +
+  geom_hline(
+    yintercept = age_diff[1,2],
+    linetype = "dashed",
+    color = "red"
+    ) +
+  geom_text(aes(
+    label = paste0(round(percent_diff), "%"),
+    vjust = -0.2)) +
+  labs(
+    title = "How Does Stop Duration Vary by Perceived Age When Contextualizing?",
+    x = "Perceived Age",
+    y = "% Difference From 18 - 24"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+```{r, echo = FALSE, fig.width=7, fig.height=3.9, out.width='\\linewidth'}
+gender_diff <- time_diff_2[c(1, 7,8),]
+gender_diff[1,1] <- 'Female (Intercept)'
+gender_diff$Feature <-
+  relevel(factor(gender_diff$Feature), ref = 'Female (Intercept)')
+gender_diff <- gender_diff[order(-gender_diff$`ratio`), ]
+gender_diff$Feature <- factor(
+  gender_diff$Feature,
+  levels = gender_diff$Feature
+)
+ggplot(
+  gender_diff,
+  aes(
+    x = Feature,
+    y = ratio,
+    fill = Feature
+    )
+  ) +
+  geom_bar(
+    stat = 'identity',
+    fill = 'skyblue'
+    ) +
+  geom_hline(
+    yintercept = gender_diff[2,2],
+    linetype = "dashed",
+    color = "red"
+    ) +
+  geom_text(aes(
+    label = paste0(round(percent_diff), "%"),
+    vjust = -0.25)) +
+  labs(
+    title = "How Does Stop Duration Vary by Perceived Gender When Contextualizing?",
+    x = "Perceived Gender",
+    y = "% Difference From Female"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+For race, age, and gender, we see:
+
+All statistically significant races now see an increase in estimated stop duration. Recall the perceived Asian feature previously saw a decrease, its stop duration increased 16% from the previous model. Perceived Black and Hispanic saw decreases of 10% and 2% from the last model, respectively. Our model indicates that individuals perceived as Asian, Black, Hispanic, or Other are estimated to have longer stop durations at police stops in San Francisco.
+
+All age groups older than 21 estimate decreases in stop time of at least 6%. The model then indicates that those aged 18-28 see a systematic increase in stop time relative to groups older than them.
+
+As for gender, our model implies that males see a decrease in stop time of 4% from females, while those who are perceived as non-cis gendered see an increase of 9%. Non-cis-gendered individuals estimated stop time is 13% greater than that of males. This is a difference greater than any other two comparable groups in the model.
+
+While adding non-perceived characteristic features to the model greatly improved its descriptive power, they did not explain away the majority of power of the perceived racial groups included. Our model indicates that perceived race, age, and gender do relate the duration of a police stop.
+
+```{r, echo = FALSE, results = 'asis'}
+#anova(base_model, model)
+tab <- anova(base_model, model)
+
+kable(tab,
+      format = "latex",
+      booktabs = TRUE,
+      digits = 3,
+      caption = "ANOVA Comparison for Base Model vs Extended Model") %>%
+  kable_styling(
+    latex_options = c("hold_position", "striped", "repeat_header")
+  )
+```
+
+The F value (F ~2,500) is large, indicating an improvement in model performance from the added variables. Since our p value is much smaller than .05, we can reject the null hypothesis that there is no improvement in model fit caused by the additional variables.
+
+### Conclusion
+
+Although the dataset (and human behavior) is noisy, our model was effectively able to capture 25% of the observed variability in stop duration across stops in San Francisco. At a high level, there is a meaningful difference in the average stop duration (as a measure of treatment of individuals) across the stopped individual's race, as perceived by the engaged police officer. When contextualizing that difference with other factors that influence the course of a stop, the difference is muted, but still present and significant. Further research should be done to understand the underlying cause of this relationship and potential actions that can be taken to mitigate it moving forward.
+
+\newpage
+
+### Appendix
+
+Link to Dataset: https://data.sfgov.org/Public-Safety/Count-of-Individuals-Stopped-by-Reason-for-Stop-by/a5da-x8ji 
+
+Note: The data dictionary does not open, though we can reasonably interpret the variables within the dataset. 
+
+Summary of dataset cleaning:
+
+| Field | Filter/Transform | Purpose |
+|-------|-----------------|---------|
+| Duration of Stop | Keep rows greater than 0 and less than 480. Transform by taking natural log | Removes NULL, obvious errors. Keeps bounds of study to stops within 8 hours. Addresses strong right skew |
+| Perceived Age | Keep rows between 18 and 100 | Focuses scope on treatment of adults only, and removes obvious errors |
+| District | Remove NULL. Replace characters with upper-case string. | Removes NULL. Removes duplicates |
+| City | Keep rows equal to "San Francisco" | Focuses scope on San Francisco stops only |
+
+
+| Field | Recode |
+|-------|--------|
+| Age Group | Buckets samples by perceived age 18–28, 29–44, 45–60, and 61+ |
+| Perceived Race | Contains 'black', then 'Black / African American'. Contains 'hispanic', then 'Hispanic / Latino(a/x)'. Contains 'other', 'multi-racial', 'islander', or 'native', then 'Other' |
+| Perceived Race | If 'Middle Eastern or South Asian', then 'MESA' |
+| Gender | Contains 'transgender', 'nonbinary', or 'nonconforming', then 'Not Cisgender'. Contains 'Cisgender man / boy', then 'Male'. Contains 'Cisgender woman / girl', then 'Female' |
+| Stop Type | Contains 'bicycle' or 'pedestrian', then 'Pedestrian Stop' |
+
+To get to our final model, we included fields in the dataset that could reasonably be transformed into an input feature. Excluding the features that did make it into the model, that includes: season (e.g., fall, winter), day of week, location, is location k12 public school, is LGBT, has limited english, perceived disability, is person unhoused, is welfare check, traffic violation type. We did not include any fields that might occur after the stop, like actions taken (e.g, search), type of property seized, or result of stop. 
+
+Residuals vs Fitted
+```{r, echo = FALSE, fig.width=7, fig.height=3.9, out.width='\\linewidth'}
+plot(model, which = 1)
+```
+
+Note: The residuals vs fitted follows a pattern of many straight lines. This is because the data is manually entered by officers, who often round to the nearest 5, 10, or 15 minute intervals. 
+
+
